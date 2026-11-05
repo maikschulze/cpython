@@ -46,6 +46,12 @@ typedef struct {
        1 means the end of the first frame has been reached. */
     bool eof;
 
+    /* 1 until a decompress() call passes the first input of a frame. */
+    bool at_frame_start;
+
+    /* The largest window the frame may require, set by window_log_max. */
+    unsigned long long max_window_size;
+
     /* Lock to protect the decompression context */
     PyMutex lock;
 } ZstdDecompressor;
@@ -79,6 +85,11 @@ _get_DDict(ZstdDict *self)
 
     return self->d_dict;
 }
+
+/* zstd refuses frames that need a larger window than this, unless
+   window_log_max is set (ZSTD_WINDOWLOG_LIMIT_DEFAULT, in zstd's static
+   API). */
+#define DEFAULT_MAX_WINDOW_SIZE (1ULL << 27)
 
 static int
 _zstd_set_d_parameters(ZstdDecompressor *self, PyObject *options)
@@ -128,6 +139,11 @@ _zstd_set_d_parameters(ZstdDecompressor *self, PyObject *options)
         if (ZSTD_isError(zstd_ret)) {
             set_parameter_error(0, key_v, value_v);
             return -1;
+        }
+        if (key_v == ZSTD_d_windowLogMax) {
+            /* 0 means the default */
+            self->max_window_size = value_v ? 1ULL << value_v
+                                            : DEFAULT_MAX_WINDOW_SIZE;
         }
     }
     return 0;
@@ -187,6 +203,59 @@ _zstd_load_d_dict(ZstdDecompressor *self, PyObject *dict)
     return ret;
 }
 
+/* The size to allocate for the whole output of a frame, or -1 to grow the
+   output buffer block by block.
+
+   If the input holds a whole frame that records its content size, allocate
+   all of it at once: the data is written once, without the copies of a
+   growing buffer, and zstd decodes straight into it (its single-pass mode)
+   instead of through its internal window buffer. */
+static Py_ssize_t
+frame_output_size(ZstdDecompressor *self, ZSTD_inBuffer *in,
+                  Py_ssize_t max_length)
+{
+    const unsigned char *src = (const unsigned char *)in->src + in->pos;
+    size_t avail = in->size - in->pos;
+    unsigned long long size = ZSTD_getFrameContentSize(src, avail);
+    if (size == ZSTD_CONTENTSIZE_UNKNOWN || size == ZSTD_CONTENTSIZE_ERROR
+        || size == 0 || size > (unsigned long long)PY_SSIZE_T_MAX
+        || (max_length >= 0 && (unsigned long long)max_length < size))
+    {
+        return -1;
+    }
+    /* zstd's single-pass mode doesn't check window_log_max: leave a frame
+       that needs a larger window to the streaming mode, which refuses it.
+       The header is complete and not a skippable frame, as it records a
+       content size other than 0. The window size is the content size for a
+       single-segment frame, else given by the window descriptor that
+       follows the frame header descriptor (RFC 8878, 3.1.1.1.2). */
+    unsigned long long window_size = size;
+    if (!(src[4] & 0x20)) {
+        unsigned char exponent = src[5] >> 3, mantissa = src[5] & 7;
+        unsigned long long window_base = 1ULL << (10 + exponent);
+        window_size = window_base + window_base / 8 * mantissa;
+    }
+    if (window_size > self->max_window_size) {
+        return -1;
+    }
+    size_t frame_size = ZSTD_findFrameCompressedSize(src, avail);
+    if (ZSTD_isError(frame_size) || frame_size > avail) {
+        return -1;
+    }
+    /* The header is untrusted input: don't allocate more than the frame can
+       decode to. A block that produces output takes at least 4 bytes (an RLE
+       block: a 3-byte header and the byte to repeat) and decodes to at most
+       128 KiB (ZSTD_BLOCKSIZE_MAX). */
+    const unsigned long long block_size_max = 128 * 1024;
+    unsigned long long max_blocks = frame_size / 4;
+    if (max_blocks <= ULLONG_MAX / block_size_max
+        && size > max_blocks * block_size_max)
+    {
+        return -1;
+    }
+    return (Py_ssize_t)size;
+}
+
 /*
     Decompress implementation in pseudo code:
 
@@ -220,8 +289,31 @@ decompress_lock_held(ZstdDecompressor *self, ZSTD_inBuffer *in,
     _BlocksOutputBuffer buffer = {.writer = NULL};
     PyObject *ret;
 
-    /* Initialize the output buffer */
-    if (_OutputBuffer_InitAndGrow(&buffer, &out, max_length) < 0) {
+    /* Initialize the output buffer: at the start of a frame, with the size
+       recorded in its header if it can be trusted, otherwise growing. */
+    Py_ssize_t init_size = -1;
+    if (self->at_frame_start && in->pos < in->size) {
+        /* zstd consumes input from here on, so later calls are not at the
+           start of the frame, even if this one doesn't pre-size it. */
+        self->at_frame_start = 0;
+        init_size = frame_output_size(self, in, max_length);
+    }
+    if (init_size > 0
+        && _OutputBuffer_InitWithSize(&buffer, &out, max_length,
+                                      init_size) < 0)
+    {
+        /* The size comes from the input: fall back to growing. */
+        if (!PyErr_ExceptionMatches(PyExc_MemoryError)
+            && !PyErr_ExceptionMatches(PyExc_OverflowError))
+        {
+            goto error;
+        }
+        PyErr_Clear();
+        init_size = -1;
+    }
+    if (init_size <= 0
+        && _OutputBuffer_InitAndGrow(&buffer, &out, max_length) < 0)
+    {
         goto error;
     }
     assert(out.pos == 0);
@@ -294,6 +386,7 @@ decompressor_reset_session_lock_held(ZstdDecompressor *self)
     /* Reset variables in one operation */
     self->needs_input = 1;
     self->eof = 0;
+    self->at_frame_start = 1;
 
     /* Resetting session is guaranteed to never fail */
     ZSTD_DCtx_reset(self->dctx, ZSTD_reset_session_only);
@@ -498,6 +591,8 @@ _zstd_ZstdDecompressor_new_impl(PyTypeObject *type, PyObject *zstd_dict,
     self->in_end = -1;
     self->unused_data = NULL;
     self->eof = 0;
+    self->at_frame_start = 1;
+    self->max_window_size = DEFAULT_MAX_WINDOW_SIZE;
     self->dict = NULL;
     self->lock = (PyMutex){0};
 

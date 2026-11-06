@@ -87,9 +87,9 @@ _get_DDict(ZstdDict *self)
 }
 
 /* zstd refuses frames that need a larger window than this, unless
-   window_log_max is set (ZSTD_WINDOWLOG_LIMIT_DEFAULT, in zstd's static
-   API). */
-#define DEFAULT_MAX_WINDOW_SIZE (1ULL << 27)
+   window_log_max is set (ZSTD_MAXWINDOWSIZE_DEFAULT, in zstd's private
+   API: (1 << ZSTD_WINDOWLOG_LIMIT_DEFAULT) + 1). */
+#define DEFAULT_MAX_WINDOW_SIZE ((1ULL << 27) + 1)
 
 static int
 _zstd_set_d_parameters(ZstdDecompressor *self, PyObject *options)
@@ -216,6 +216,15 @@ frame_output_size(ZstdDecompressor *self, ZSTD_inBuffer *in,
 {
     const unsigned char *src = (const unsigned char *)in->src + in->pos;
     size_t avail = in->size - in->pos;
+    /* Only zstd1 frames: libzstd also accepts legacy (v0.5-v0.7) frames
+       here, whose headers have another layout and which it never decodes in
+       a single pass. */
+    if (avail < 4
+        || ((uint32_t)src[0] | (uint32_t)src[1] << 8 | (uint32_t)src[2] << 16
+            | (uint32_t)src[3] << 24) != ZSTD_MAGICNUMBER)
+    {
+        return -1;
+    }
     unsigned long long size = ZSTD_getFrameContentSize(src, avail);
     if (size == ZSTD_CONTENTSIZE_UNKNOWN || size == ZSTD_CONTENTSIZE_ERROR
         || size == 0 || size > (unsigned long long)PY_SSIZE_T_MAX

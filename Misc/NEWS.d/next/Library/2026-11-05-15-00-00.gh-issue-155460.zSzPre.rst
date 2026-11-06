@@ -1,5 +1,5 @@
 :mod:`compression.zstd` now allocates the output of a frame that records its
-decompressed size once, at that size, instead of growing it while
-decompressing. This lowers peak memory use and makes decompression faster:
-up to 3 times on Windows. The recorded size is only used when the whole frame
-is available and could decode to that size.
+decompressed size once, at that size, and decodes straight into it, instead
+of growing the output while decompressing. This lowers peak memory use and
+makes decompressing such frames several times faster. The recorded size is
+only used when the whole frame is available and could decode to that size.

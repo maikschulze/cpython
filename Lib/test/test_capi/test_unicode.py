@@ -1888,7 +1888,10 @@ class CAPITest(unittest.TestCase):
         s = fresh_string('hello')
         self.assertEqual(check_interned(s), SSTATE_NOT_INTERNED)
 
-        s = fresh_string('long string unlikely to be used by Python')
+        # Built at run time: a constant of this module may already be
+        # interned (and immortal) when the .pyc file was written by a
+        # free-threaded build.
+        s = fresh_string(''.join(['long string ', 'unlikely to be used by Python']))
         s = sys.intern(s)
         if support.Py_GIL_DISABLED:
             self.assertEqual(check_interned(s), SSTATE_INTERNED_IMMORTAL)

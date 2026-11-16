@@ -1,0 +1,2 @@
+Fix ``test_capi.test_unicode.test_check_interned`` on a default build that
+reads a ``.pyc`` file written by a :term:`free-threaded build`.
